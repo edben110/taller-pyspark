@@ -19,8 +19,8 @@ Reglas del normalizador (una por columna):
                 con el mismo nombre de producto deben tener el MISMO precio.
   * Quantity  : sin nulos, sin letras y no menor a 0 (>= 0).
   * UnitPrice : sin nulos, sin letras y no menor a 0 (>= 0).
-  * InvoiceDate: fecha correcta y con el formato dia/mes/año hora:minuto
-                ("d/M/yyyy H:mm", p.ej. "12/1/2010 8:26").
+  * InvoiceDate: fecha correcta y con el formato mes/dia/año hora:minuto
+                ("M/d/yyyy H:mm", p.ej. "12/1/2010 8:26").
   * CustomerID: misma regla que InvoiceNo (id numerico valido, digitos).
   * Consistencia de factura: si hay 2+ filas con la misma InvoiceNo pero con
     CustomerID diferente o fecha diferente, TODAS las filas de esa factura se
@@ -63,7 +63,7 @@ for _d in glob.glob(os.path.join(OUT_DIR, "_tmp_*")):
     shutil.rmtree(_d, ignore_errors=True)
 
 CSV_ORIGINAL = os.path.join(DATA_DIR, "online_retail.csv")
-CSV_PROCESADO = os.path.join(DATA_DIR, "online_retail_clean.csv")
+CSV_PROCESADO = os.path.join(DATA_DIR, "online_retail_clean_md.csv")
 ID_DATASET = 352  # Online Retail en UCI
 
 
@@ -185,7 +185,7 @@ def _valid_num(col_name):
         (F.col(col_name).cast("double") >= 0)
 
 
-# Fecha: correcta, con el formato dia/mes/año hora:minuto (d/M/yyyy H:mm)
+# Fecha: correcta, con el formato mes/dia/año hora:minuto (M/d/yyyy H:mm)
 # y dentro del rango [2010-12-01, 2011-12-09].
 # try_to_timestamp NO lanza excepcion en modo ANSI (Spark 4.x); las fechas que
 # no cumplen el formato devuelven NULL y la fila se marca como invalida.
@@ -193,7 +193,7 @@ def _valid_date():
     raw = F.trim(F.col("InvoiceDate").cast("string"))
     fecha_min = F.to_timestamp(F.lit("2010-12-01 00:00:00"))
     fecha_max = F.to_timestamp(F.lit("2011-12-09 23:59:59"))
-    ts = F.try_to_timestamp(raw, F.lit("d/M/yyyy H:mm"))
+    ts = F.try_to_timestamp(raw, F.lit("M/d/yyyy H:mm"))
     return (raw.isNotNull() & (raw != "") &
             raw.rlike(r"^\d{1,2}/\d{1,2}/\d{4} \d{1,2}:\d{2}$") &
             ts.isNotNull() &
@@ -303,7 +303,7 @@ print("Facturas (InvoiceNo) distintas en CSV procesado:",
 
 # --- 3.5 ESCRIBIR el SEGUNDO CSV (procesado / limpio) -------------------------
 print(f"\n[LOAD FASE A] Escribiendo CSV procesado: {CSV_PROCESADO}")
-write_single_csv(df_procesado, CSV_PROCESADO, "online_retail_clean")
+write_single_csv(df_procesado, CSV_PROCESADO, "online_retail_clean_md")
 print("CSV procesado generado:", CSV_PROCESADO)
 
 # ============================================================================
@@ -330,7 +330,7 @@ df.show(5, truncate=False)
 # --- 4. Seleccion de columnas y columnas derivadas ---------------------------
 df = df \
     .withColumn("InvoiceDateTs", F.try_to_timestamp(F.col("InvoiceDate").cast("string"),
-                                                F.lit("d/M/yyyy H:mm"))) \
+                                                F.lit("M/d/yyyy H:mm"))) \
     .withColumn("revenue", F.round(F.col("Quantity").cast("double") *
                                    F.col("UnitPrice").cast("double"), 2)) \
     .withColumn("anio", F.year("InvoiceDateTs")) \
