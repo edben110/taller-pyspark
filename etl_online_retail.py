@@ -15,14 +15,18 @@ Reglas del normalizador (una por columna):
                 sin caracteres especiales y sin nulos. Se permiten ids repetidos
                 (varios articulos pertenecen a una misma factura).
   * StockCode : misma regla que InvoiceNo (solo ids de producto, digitos).
-  * Description: sin caracteres especiales, salvo "_" o "-".
+  * Description: sin caracteres especiales, salvo "_" o "-". Ademas, descripciones
+                con el mismo nombre de producto deben tener el MISMO precio.
   * Quantity  : sin nulos, sin letras y no menor a 0 (>= 0).
   * UnitPrice : sin nulos, sin letras y no menor a 0 (>= 0).
-  * InvoiceDate: fecha correcta y con el formato "M/d/yyyy H:mm" (usa "/").
+  * InvoiceDate: fecha correcta y con el formato dia/mes/año hora:minuto
+                ("d/M/yyyy H:mm", p.ej. "12/1/2010 8:26").
   * CustomerID: misma regla que InvoiceNo (id numerico valido, digitos).
   * Consistencia de factura: si hay 2+ filas con la misma InvoiceNo pero con
     CustomerID diferente o fecha diferente, TODAS las filas de esa factura se
     ignoran en la lectura de datos.
+  * Consistencia de precio: si una misma Description (nombre de producto)
+    aparece con 2+ UnitPrice distintos, TODAS sus filas se ignoran.
 
 Cargar      : resultados en CSV (carpeta out/) + CSV procesado en data/
 
@@ -181,11 +185,15 @@ def _valid_num(col_name):
         (F.col(col_name).cast("double") >= 0)
 
 
-# Fecha: correcta y con el formato M/d/yyyy H:mm (usa "/").
+# Fecha: correcta y con el formato dia/mes/año hora:minuto (d/M/yyyy H:mm).
+# try_to_timestamp NO lanza excepcion en modo ANSI (Spark 4.x); las fechas que
+# no cumplen el formato devuelven NULL y la fila se marca como invalida.
 def _valid_date():
     raw = F.trim(F.col("InvoiceDate").cast("string"))
-    ts = F.to_timestamp(raw, "M/d/yyyy H:mm")
-    return raw.contains("/") & ts.isNotNull(), ts
+    ts = F.try_to_timestamp(raw, F.lit("d/M/yyyy H:mm"))
+    return (raw.isNotNull() & (raw != "") &
+            raw.rlike(r"^\d{1,2}/\d{1,2}/\d{4} \d{1,2}:\d{2}$") &
+            ts.isNotNull()), ts
 
 
 _desc_trim = F.trim(F.col("Description").cast("string"))
@@ -238,17 +246,35 @@ print("\nTras validar TODAS las columnas:")
 print("  Filas totales de la fuente          :", df_norm.count())
 print("  Filas que cumplen todas las reglas  :", df_fila_valida.count())
 
-# --- 3.3 Consistencia de factura ---------------------------------------------
+# --- 3.3 Consistencia de precio por producto ---------------------------------
+# Si una misma Description (nombre de producto) aparece con 2+ UnitPrice
+# distintos, TODAS las filas de ese producto se ignoran.
+df_precios_inconsistentes = df_fila_valida.groupBy("_desc_trim").agg(
+    F.countDistinct("UnitPrice").alias("n_precios"),
+    F.count("_desc_trim").alias("n_filas")) \
+    .filter(F.col("n_precios") > 1)
+
+print("\nDescripciones con precio inconsistente (a descartar):",
+      df_precios_inconsistentes.count())
+df_precios_inconsistentes.show(5, truncate=False)
+
+df_sin_precio_ok = df_fila_valida \
+    .join(df_precios_inconsistentes.select("_desc_trim"),
+          on="_desc_trim", how="left_anti")
+print("Filas que cumplen TODAS las reglas + precio consistente:",
+      df_sin_precio_ok.count())
+
+# --- 3.4 Consistencia de factura ---------------------------------------------
 # Si 2+ filas con la misma InvoiceNo tienen CustomerID diferente o fecha
 # diferente, TODAS las filas de esa factura se ignoran.
-df_inconsistentes = df_fila_valida.groupBy("InvoiceNo").agg(
+df_inconsistentes = df_sin_precio_ok.groupBy("InvoiceNo").agg(
     F.countDistinct("CustomerID").alias("n_clientes"),
     F.countDistinct("InvoiceDateTs").alias("n_fechas")) \
     .filter((F.col("n_clientes") > 1) | (F.col("n_fechas") > 1))
 
 print("\nFacturas inconsistentes (a descartar):", df_inconsistentes.count())
 
-df_procesado = df_fila_valida \
+df_procesado = df_sin_precio_ok \
     .join(df_inconsistentes.select("InvoiceNo"), on="InvoiceNo", how="left_anti") \
     .dropDuplicates() \
     .select(
@@ -271,7 +297,7 @@ print(f"Filas eliminadas : {n_original - n_procesado}")
 print("Facturas (InvoiceNo) distintas en CSV procesado:",
       df_procesado.select("InvoiceNo").distinct().count())
 
-# --- 3.4 ESCRIBIR el SEGUNDO CSV (procesado / limpio) -------------------------
+# --- 3.5 ESCRIBIR el SEGUNDO CSV (procesado / limpio) -------------------------
 print(f"\n[LOAD FASE A] Escribiendo CSV procesado: {CSV_PROCESADO}")
 write_single_csv(df_procesado, CSV_PROCESADO, "online_retail_clean")
 print("CSV procesado generado:", CSV_PROCESADO)
@@ -299,7 +325,8 @@ df.show(5, truncate=False)
 
 # --- 4. Seleccion de columnas y columnas derivadas ---------------------------
 df = df \
-    .withColumn("InvoiceDateTs", F.to_timestamp("InvoiceDate", "M/d/yyyy H:mm")) \
+    .withColumn("InvoiceDateTs", F.try_to_timestamp(F.col("InvoiceDate").cast("string"),
+                                                F.lit("d/M/yyyy H:mm"))) \
     .withColumn("revenue", F.round(F.col("Quantity").cast("double") *
                                    F.col("UnitPrice").cast("double"), 2)) \
     .withColumn("anio", F.year("InvoiceDateTs")) \
