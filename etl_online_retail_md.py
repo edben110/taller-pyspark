@@ -11,17 +11,19 @@ Transformar : FASE A -> NORMALIZADOR POR COLUMNA sobre el CSV original.
               FASE B -> las 10 consultas se ejecutan leyendo ese CSV procesado.
 
 Reglas del normalizador (una por columna):
-  * InvoiceNo : solo ids de factura -> SOLO digitos, sin negativos, sin letras,
-                sin caracteres especiales y sin nulos. Se permiten ids repetidos
-                (varios articulos pertenecen a una misma factura).
-  * StockCode : misma regla que InvoiceNo (solo ids de producto, digitos).
+  * InvoiceNo : entero de SOLO 6 digitos (sin negativos, sin letras, sin
+                caracteres especiales y sin nulos). Un id que empieza con la
+                letra 'C' es una cancelacion -> invalido (no es entero 6 digitos).
+                Se permiten ids repetidos (varios articulos de una misma factura).
+  * StockCode : entero de SOLO 5 digitos (un id distinto por producto).
   * Description: sin caracteres especiales, salvo "_" o "-". Ademas, descripciones
                 con el mismo nombre de producto deben tener el MISMO precio.
   * Quantity  : sin nulos, sin letras y no menor a 0 (>= 0).
   * UnitPrice : sin nulos, sin letras y no menor a 0 (>= 0).
   * InvoiceDate: fecha correcta y con el formato mes/dia/año hora:minuto
-                ("M/d/yyyy H:mm", p.ej. "12/1/2010 8:26").
-  * CustomerID: misma regla que InvoiceNo (id numerico valido, digitos).
+                ("M/d/yyyy H:mm", p.ej. "12/1/2010 8:26"), dentro del rango
+                [2010-12-01, 2011-12-09].
+  * CustomerID: entero de SOLO 5 digitos (un id asignado a un solo cliente).
   * Consistencia de factura: si hay 2+ filas con la misma InvoiceNo pero con
     CustomerID diferente o fecha diferente, TODAS las filas de esa factura se
     ignoran en la lectura de datos.
@@ -170,11 +172,13 @@ df_raw.show(5, truncate=False)
 # --- 3.1 Reglas por columna (cada una genera un flag _ok_<columna>) -----------
 
 # Id numerico: SOLO digitos, sin negativos, sin letras, sin caracteres
-# especiales y sin nulos. Tolera el sufijo '.0' (p.ej. '17850.0').
-def _valid_id(col_name):
+# especiales y sin nulos, con una longitud EXACTA de digitos.
+# Tolera el sufijo '.0' (p.ej. '12838.0').
+def _valid_id(col_name, n_digitos):
     t = F.trim(F.col(col_name).cast("string"))
     num = F.regexp_replace(t, r"\.0+$", "")
-    return num.isNotNull() & (num != "") & num.rlike(r"^[0-9]+$")
+    return num.isNotNull() & (num != "") & \
+        num.rlike(rf"^[0-9]{{{n_digitos}}}$")
 
 
 # Numerico: sin nulos, sin letras y no menor a 0.
@@ -187,17 +191,23 @@ def _valid_num(col_name):
 
 # Fecha: correcta, con el formato mes/dia/año hora:minuto (M/d/yyyy H:mm)
 # y dentro del rango [2010-12-01, 2011-12-09].
+# La hora debe ser 0-24 y los minutos 0-59.
 # try_to_timestamp NO lanza excepcion en modo ANSI (Spark 4.x); las fechas que
 # no cumplen el formato devuelven NULL y la fila se marca como invalida.
 def _valid_date():
     raw = F.trim(F.col("InvoiceDate").cast("string"))
     fecha_min = F.to_timestamp(F.lit("2010-12-01 00:00:00"))
     fecha_max = F.to_timestamp(F.lit("2011-12-09 23:59:59"))
+    hora = F.regexp_extract(raw, r"(\d{1,2}):\d{2}$", 1).cast("int")
+    minuto = F.regexp_extract(raw, r"\d{1,2}:(\d{2})$", 1).cast("int")
+    hora_valida = hora.isNotNull() & (hora >= 0) & (hora <= 24)
+    minuto_valido = minuto.isNotNull() & (minuto >= 0) & (minuto < 60)
     ts = F.try_to_timestamp(raw, F.lit("M/d/yyyy H:mm"))
     return (raw.isNotNull() & (raw != "") &
             raw.rlike(r"^\d{1,2}/\d{1,2}/\d{4} \d{1,2}:\d{2}$") &
             ts.isNotNull() &
-            (ts >= fecha_min) & (ts <= fecha_max)), ts
+            (ts >= fecha_min) & (ts <= fecha_max) &
+            hora_valida & minuto_valido), ts
 
 
 _desc_trim = F.trim(F.col("Description").cast("string"))
@@ -205,9 +215,13 @@ _ok_description = (F.col("Description").cast("string").isNotNull() &
                    (_desc_trim != "") &
                    _desc_trim.rlike(r"^[A-Za-z0-9 _\-]+$"))
 
-_ok_invoice = _valid_id("InvoiceNo")
-_ok_stock = _valid_id("StockCode")
-_ok_customer = _valid_id("CustomerID")
+# InvoiceNo: entero de EXACTAMENTE 6 digitos. Un id que empieza con la letra
+# 'C' es una cancelacion y queda invalido (no es un entero de 6 digitos).
+_ok_invoice = _valid_id("InvoiceNo", 6)
+# StockCode: entero de EXACTAMENTE 5 digitos (un id por producto).
+_ok_stock = _valid_id("StockCode", 5)
+# CustomerID: entero de EXACTAMENTE 5 digitos (un id por cliente).
+_ok_customer = _valid_id("CustomerID", 5)
 _ok_quantity = _valid_num("Quantity")
 _ok_price = _valid_num("UnitPrice")
 _ok_date, _ts = _valid_date()
