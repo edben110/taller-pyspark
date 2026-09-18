@@ -16,14 +16,16 @@ Reglas del normalizador (una por columna):
                 letra 'C' es una cancelacion -> invalido (no es entero 6 digitos).
                 Se permiten ids repetidos (varios articulos de una misma factura).
   * StockCode : entero de SOLO 5 digitos (un id distinto por producto).
-  * Description: sin caracteres especiales, salvo "_" o "-". Ademas, descripciones
-                con el mismo nombre de producto deben tener el MISMO precio.
+  * Description: sin caracteres especiales, salvo "_" o "-", y que NO empiece
+                con un numero (digito). Ademas, descripciones con el mismo
+                nombre de producto deben tener el MISMO precio.
   * Quantity  : sin nulos, sin letras y no menor a 0 (>= 0).
   * UnitPrice : sin nulos, sin letras y no menor a 0 (>= 0).
   * InvoiceDate: fecha correcta y con el formato mes/dia/año hora:minuto
                 ("M/d/yyyy H:mm", p.ej. "12/1/2010 8:26"), dentro del rango
                 [2010-12-01, 2011-12-09].
   * CustomerID: entero de SOLO 5 digitos (un id asignado a un solo cliente).
+  * Country   : debe estar especificado (no nulo, no vacio y no "Unspecified").
   * Consistencia de factura: si hay 2+ filas con la misma InvoiceNo pero con
     CustomerID diferente o fecha diferente, TODAS las filas de esa factura se
     ignoran en la lectura de datos.
@@ -213,7 +215,14 @@ def _valid_date():
 _desc_trim = F.trim(F.col("Description").cast("string"))
 _ok_description = (F.col("Description").cast("string").isNotNull() &
                    (_desc_trim != "") &
-                   _desc_trim.rlike(r"^[A-Za-z0-9 _\-]+$"))
+                   _desc_trim.rlike(r"^[A-Za-z0-9 _\-]+$") &
+                   ~_desc_trim.rlike(r"^[0-9]"))
+
+# Country: debe estar especificado (no nulo, no vacio y no "Unspecified").
+_country_trim = F.trim(F.col("Country").cast("string"))
+_ok_country = _country_trim.isNotNull() & \
+    (_country_trim != "") & \
+    (F.lower(_country_trim) != "unspecified")
 
 # InvoiceNo: entero de EXACTAMENTE 6 digitos. Un id que empieza con la letra
 # 'C' es una cancelacion y queda invalido (no es un entero de 6 digitos).
@@ -234,8 +243,10 @@ df_norm = df_raw \
     .withColumn("_ok_price", _ok_price) \
     .withColumn("_ok_date", _ok_date) \
     .withColumn("_ok_customer", _ok_customer) \
+    .withColumn("_ok_country", _ok_country) \
     .withColumn("_date_raw", F.trim(F.col("InvoiceDate").cast("string"))) \
     .withColumn("_desc_trim", _desc_trim) \
+    .withColumn("_country", _country_trim) \
     .withColumn("InvoiceDateTs", _ts)
 
 print("\nIncidencia por regla (filas que NO cumplen cada columna):")
@@ -247,6 +258,7 @@ df_norm.select(
     F.sum(F.when(~F.col("_ok_price"), 1).otherwise(0)).alias("UnitPrice invalido"),
     F.sum(F.when(~F.col("_ok_date"), 1).otherwise(0)).alias("InvoiceDate invalida"),
     F.sum(F.when(~F.col("_ok_customer"), 1).otherwise(0)).alias("CustomerID invalido"),
+    F.sum(F.when(~F.col("_ok_country"), 1).otherwise(0)).alias("Country sin especificar"),
 ).show(truncate=False)
 
 # --- 3.2 Fila valida = cumple TODAS las reglas de columna ---------------------
@@ -257,7 +269,8 @@ df_fila_valida = df_norm.filter(
     F.col("_ok_quantity") &
     F.col("_ok_price") &
     F.col("_ok_date") &
-    F.col("_ok_customer")
+    F.col("_ok_customer") &
+    F.col("_ok_country")
 )
 
 print("\nTras validar TODAS las columnas:")
