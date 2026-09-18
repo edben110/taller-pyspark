@@ -1,9 +1,25 @@
 """
 ETL con PySpark - Online Retail Dataset (UCI Machine Learning Repository, id=352)
 
-Extraccion  : Python API de UCI (ucimlrepo) -> fetch_ucirepo(id=352)
-Transformar : operaciones clave de Spark (select, filter, groupBy, join, windows...)
+Extraccion  : usa el CSV local (data/online_retail.csv) si existe; si no, lo
+              descarga con la Python API de UCI (ucimlrepo, fetch_ucirepo(id=352))
+Transformar : NORMALIZADOR POR COLUMNA + operaciones clave de Spark
+              (select, filter, groupBy, join, windows...)
 Cargar      : resultados en CSV (carpeta out/)
+
+Reglas del normalizador (una por columna):
+  * InvoiceNo : solo ids de factura -> SOLO digitos, sin negativos, sin letras,
+                sin caracteres especiales y sin nulos. Se permiten ids repetidos
+                (varios articulos pertenecen a una misma factura).
+  * StockCode : misma regla que InvoiceNo (solo ids de producto validos).
+  * Description: sin caracteres especiales, salvo "_" o "-".
+  * Quantity  : sin nulos, sin letras y no menor a 0 (>= 0).
+  * UnitPrice : sin nulos, sin letras y no menor a 0 (>= 0).
+  * InvoiceDate: fecha correcta y con el formato "M/d/yyyy H:mm" (usa "/").
+  * CustomerID: misma regla que InvoiceNo (id numerico valido).
+  * Consistencia de factura: si hay 2+ filas con la misma InvoiceNo pero con
+    CustomerID diferente o fecha diferente, TODAS las filas de esa factura se
+    ignoran en la lectura de datos.
 
 Ejecutar:
     python etl_online_retail.py
@@ -13,8 +29,6 @@ import os
 import sys
 import glob
 import shutil
-
-from ucimlrepo import fetch_ucirepo
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -59,8 +73,6 @@ def _configure_winutils():
 _configure_winutils()
 
 # Windows: apuntar los python workers al interprete del entorno actual
-import sys  # noqa: E402
-
 os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
 
@@ -78,31 +90,32 @@ def write_csv(df, name):
 
 
 # ----------------------------------------------------------------------------
-# 1. EXTRACT - Descargar el dataset con la Python API de UCI
+# 1. EXTRACT - CSV local si existe; si no, descargar con la Python API de UCI
 # ----------------------------------------------------------------------------
 print("=" * 70)
 print("ETL - Online Retail Dataset (UCI id=352)")
 print("=" * 70)
 
-retail = fetch_ucirepo(id=ID_DATASET)
+if not os.path.exists(CSV_FINAL):
+    print("\n[EXTRACT] No existe CSV local -> descargando desde UCI (ucimlrepo)")
+    from ucimlrepo import fetch_ucirepo  # noqa: E402
 
-print("\n[EXTRACT] Python API de UCI (ucimlrepo)")
-print("Nombre        :", retail.metadata["name"])
-print("Fuente        :", retail.metadata["repository_url"])
-print("Instancias    :", retail.metadata["num_instances"])
-print("DOI           :", retail.metadata["dataset_doi"])
-print("Columnas API  :", retail.metadata["index_col"], "+", list(retail.data.features.columns))
+    retail = fetch_ucirepo(id=ID_DATASET)
+    print("Nombre        :", retail.metadata["name"])
+    print("Fuente        :", retail.metadata["repository_url"])
+    print("Instancias    :", retail.metadata["num_instances"])
+    print("DOI           :", retail.metadata["dataset_doi"])
 
-# La libreria ucimlrepo separa las columnas indice (InvoiceNo, StockCode);
-# se recuperan del data_url que la propia API proporciona (CSV original completo).
-import pandas as pd  # noqa: E402
+    import pandas as pd  # noqa: E402
 
-raw = pd.read_csv(retail.metadata["data_url"], low_memory=False)
-print("DataFrame pandas (desde data_url):", raw.shape)
-print("Columnas    :", list(raw.columns))
+    raw = pd.read_csv(retail.metadata["data_url"], low_memory=False)
+    print("DataFrame pandas (desde data_url):", raw.shape)
+    raw.to_csv(CSV_FINAL, index=False)
+else:
+    print(f"\n[EXTRACT] Usando CSV local existente: {CSV_FINAL}")
 
-raw.to_csv(CSV_FINAL, index=False)
-print("Archivo local:", CSV_FINAL)
+print("Archivo local :", CSV_FINAL)
+print("Tamanio       :", os.path.getsize(CSV_FINAL), "bytes")
 
 # ----------------------------------------------------------------------------
 # 2. Lectura de datos con Spark (spark.read.format("csv"))
@@ -134,227 +147,145 @@ print("Muestra    :")
 df.show(5, truncate=False)
 
 # ----------------------------------------------------------------------------
-# 3. Seleccion de columnas (select) y exploracion
+# 3. NORMALIZADOR / VALIDADOR POR COLUMNA
+#    Cada regla genera una columna booleana _ok_<columna>. Al final solo se
+#    conservan las filas que cumplen TODAS las reglas.
 # ----------------------------------------------------------------------------
-print("\n[SELECCION] select()")
-df_claves = df.select("InvoiceNo", "StockCode", "Description", "Quantity",
-                      "UnitPrice", "CustomerID", "Country")
-df_claves.show(5, truncate=False)
+print("\n" + "=" * 70)
+print("NORMALIZADOR POR COLUMNA (validaciones individuales)")
+print("=" * 70)
+
+
+def _valid_id(col_name):
+    """Id numerico: solo digitos, sin negativos, sin letras, sin caracteres
+    especiales y sin nulos. Tolera el sufijo '.0' (p.ej. '17850.0')."""
+    t = F.trim(F.col(col_name).cast("string"))
+    num = F.regexp_replace(t, r"\.0+$", "")
+    return (num.isNotNull() & (num != "") & num.rlike(r"^[0-9]+$") &
+            (F.col(col_name).cast("long") >= 0))
+
+
+def _valid_num(col_name):
+    """Numerico: sin nulos, sin letras y no menor a 0."""
+    t = F.trim(F.col(col_name).cast("string"))
+    return (t.isNotNull() & (t != "") &
+            t.rlike(r"^[0-9]+(\.[0-9]+)?$") &
+            (F.col(col_name).cast("double") >= 0))
+
+
+def _valid_date():
+    """Fecha correcta con el formato M/d/yyyy H:mm (usa '/')."""
+    raw = F.col("InvoiceDate").cast("string")
+    ts = F.to_timestamp(raw, "M/d/yyyy H:mm")
+    return raw.contains("/") & ts.isNotNull(), ts
+
+
+_desc_trim = F.trim(F.col("Description").cast("string"))
+_ok_description = (_desc_trim.isNotNull() &
+                   (_desc_trim != "") &
+                   _desc_trim.rlike(r"^[A-Za-z0-9 _\-]+$"))
+
+_ok_invoice = _valid_id("InvoiceNo")
+_ok_stock = _valid_id("StockCode")
+_ok_customer = _valid_id("CustomerID")
+_ok_quantity = _valid_num("Quantity")
+_ok_price = _valid_num("UnitPrice")
+_ok_date, _ts = _valid_date()
+
+df_norm = df \
+    .withColumn("_ok_invoice", _ok_invoice) \
+    .withColumn("_ok_stock", _ok_stock) \
+    .withColumn("_ok_description", _ok_description) \
+    .withColumn("_ok_quantity", _ok_quantity) \
+    .withColumn("_ok_price", _ok_price) \
+    .withColumn("_ok_date", _ok_date) \
+    .withColumn("_ok_customer", _ok_customer) \
+    .withColumn("_date_raw", F.col("InvoiceDate").cast("string")) \
+    .withColumn("_desc_trim", _desc_trim) \
+    .withColumn("InvoiceDateTs", _ts)
+
+# Reporte de cuantas filas incumplen cada regla individual
+print("\nIncidencia por regla (filas que NO cumplen cada columna):")
+df_norm.select(
+    F.sum(F.when(~F.col("_ok_invoice"), 1).otherwise(0)).alias("InvoiceNo invalido"),
+    F.sum(F.when(~F.col("_ok_stock"), 1).otherwise(0)).alias("StockCode invalido"),
+    F.sum(F.when(~F.col("_ok_description"), 1).otherwise(0)).alias("Description invalida"),
+    F.sum(F.when(~F.col("_ok_quantity"), 1).otherwise(0)).alias("Quantity invalida"),
+    F.sum(F.when(~F.col("_ok_price"), 1).otherwise(0)).alias("UnitPrice invalido"),
+    F.sum(F.when(~F.col("_ok_date"), 1).otherwise(0)).alias("InvoiceDate invalida"),
+    F.sum(F.when(~F.col("_ok_customer"), 1).otherwise(0)).alias("CustomerID invalido"),
+).show(truncate=False)
+
+# 3.1 Fila valida = cumple TODAS las reglas de columna
+df_fila_valida = df_norm.filter(
+    F.col("_ok_invoice") &
+    F.col("_ok_stock") &
+    F.col("_ok_description") &
+    F.col("_ok_quantity") &
+    F.col("_ok_price") &
+    F.col("_ok_date") &
+    F.col("_ok_customer")
+)
+
+print("\nTras validar TODAS las columnas:")
+print("  Filas totales de la fuente:", df_norm.count())
+print("  Filas que cumplen todas    :", df_fila_valida.count())
 
 # ----------------------------------------------------------------------------
-# 4. Limpieza y columnas derivadas (withColumn)
+# 4. Consistencia por factura: si 2+ filas con la misma InvoiceNo tienen
+#    CustomerID diferente o fecha diferente, la factura se ignora por completo.
 # ----------------------------------------------------------------------------
-print("\n[TRANSFORM] withColumn()")
-df = df \
-    .withColumn("InvoiceDateTs", F.to_timestamp("InvoiceDate", "M/d/yyyy H:mm")) \
-    .withColumn("revenue", F.round(F.col("Quantity") * F.col("UnitPrice"), 2)) \
+print("\n" + "=" * 70)
+print("CONSISTENCIA DE FACTURA (InvoiceNo -> mismo CustomerID y misma fecha)")
+print("=" * 70)
+
+df_inconsistentes = df_fila_valida.groupBy("InvoiceNo").agg(
+    F.countDistinct("CustomerID").alias("n_clientes"),
+    F.countDistinct("InvoiceDateTs").alias("n_fechas")) \
+    .filter((F.col("n_clientes") > 1) | (F.col("n_fechas") > 1))
+
+n_facturas_inconsistentes = df_inconsistentes.count()
+print("Facturas inconsistentes (a descartar):", n_facturas_inconsistentes)
+
+df_limpio = df_fila_valida \
+    .join(df_inconsistentes.select("InvoiceNo"), on="InvoiceNo", how="left_anti") \
+    .dropDuplicates() \
+    .drop("_ok_invoice", "_ok_stock", "_ok_description", "_ok_quantity",
+          "_ok_price", "_ok_date", "_ok_customer", "_date_raw", "_desc_trim")
+
+n_original = df_norm.count()
+n_limpio = df_limpio.count()
+print(f"Filas originales  : {n_original}")
+print(f"Filas limpias     : {n_limpio}")
+print(f"Filas eliminadas  : {n_original - n_limpio}")
+
+# ----------------------------------------------------------------------------
+# 5. Seleccion de columnas (select) y columnas derivadas (withColumn)
+# ----------------------------------------------------------------------------
+print("\n[SELECCION] select() + columnas derivadas")
+df_limpio = df_limpio \
+    .withColumn("revenue", F.round(F.col("Quantity").cast("double") *
+                                   F.col("UnitPrice").cast("double"), 2)) \
     .withColumn("anio", F.year("InvoiceDateTs")) \
     .withColumn("mes", F.month("InvoiceDateTs")) \
     .withColumn("mes_nombre", F.date_format("InvoiceDateTs", "MMMM")) \
     .withColumn("year_month", F.date_format("InvoiceDateTs", "yyyyMM").cast("int")) \
-    .withColumn("es_cancelacion", F.col("InvoiceNo").startswith("C")) \
-    .withColumn("es_devolucion", F.col("Quantity") < 0) \
+    .withColumn("es_cancelacion", F.col("InvoiceNo").cast("string").startswith("C")) \
+    .withColumn("es_devolucion", F.col("Quantity").cast("double") < 0) \
     .cache()
 
-df.count()  # forzar materializacion del DataFrame en memoria
-
-df.show(5, truncate=False)
-
-# ----------------------------------------------------------------------------
-# 4.1 Limpieza: eliminar filas duplicadas, valores nulos y no numericos
-#     para que los calculos y consultas solo operen sobre datos validos
-# ----------------------------------------------------------------------------
-
-# Criterio de datos validos (indicado por el usuario / LibreOffice):
-#   * Filas identicas (duplicados) eliminadas
-#   * Misma clave (InvoiceNo, StockCode) repetida -> solo la primera
-#   * Valores repetidos de una columna / repetidos (bajo el criterio numerico)
-#   * Numericos (Quantity, UnitPrice, CustomerID): NO negativos, SIN letras y NO nulos
-df_limpio = df.dropDuplicates() \
-    .dropDuplicates(["InvoiceNo", "StockCode"]) \
-    .filter(
-        F.col("InvoiceNo").isNotNull() & (F.trim(F.col("InvoiceNo")) != "") &
-        F.col("StockCode").isNotNull() & (F.trim(F.col("StockCode")) != "") &
-        F.col("Description").isNotNull() &
-        F.col("Quantity").isNotNull() &
-        (F.col("Quantity") >= 0) &
-        F.col("Quantity").cast("double").isNotNull() &
-        F.col("UnitPrice").isNotNull() &
-        (F.col("UnitPrice") >= 0) &
-        F.col("UnitPrice").cast("double").isNotNull() &
-        F.col("CustomerID").isNotNull() &
-        F.col("CustomerID").cast("long").isNotNull() &
-        (F.col("CustomerID").cast("long") >= 0)
-    ) \
-    .cache()
-
-n_original = df.count()
-n_limpio = df_limpio.count()
-print(f"Filas originales  : {n_original}")
-print(f"Filas limpias     : {n_limpio}")
-print(f"Filas eliminadas  : {n_original - n_limpio} "
-      "(duplicados, nulos, no numericos y negativos)")
+df_limpio.count()  # forzar materializacion del DataFrame en memoria
+df_limpio.show(5, truncate=False)
 
 # Ventas validas (sobre datos limpios): no canceladas, cantidad positiva,
 # precio no negativo
 df_ventas = df_limpio.where(~F.col("es_cancelacion")) \
-              .where(F.col("Quantity") > 0) \
-              .where(F.col("UnitPrice") >= 0)
+                     .where(F.col("Quantity").cast("double") > 0) \
+                     .where(F.col("UnitPrice").cast("double") >= 0)
 
-print("\n[FILTRADO] filter()/where() -> ventas validas (sobre df_limpio)")
+print("\n[FILTRADO] ventas validas (sobre df_limpio)")
 print("Filas con ventas validas:", df_ventas.count())
 print("Facturas validas distintas:", df_ventas.select("InvoiceNo").distinct().count())
-
-# ----------------------------------------------------------------------------
-# 5. Validaciones de calidad de datos
-#    (valores negativos, ids repetidos, datos iguales,
-#     nulos y claves inconsistentes) - solo se imprimen, no generan CSV
-# ----------------------------------------------------------------------------
-print("\n" + "=" * 70)
-print("VALIDACIONES DE CALIDAD DE DATOS (resultados en consola)")
-print("=" * 70)
-
-TOTAL_FILAS = df.count()
-COLUMNAS = df.columns
-
-
-def _filas(expr):
-    return df.filter(expr).count()
-
-
-# --- V1. Valores negativos en facturas ----------------------------------------
-n_qty_neg = _filas(F.col("Quantity") < 0)
-n_price_neg = _filas(F.col("UnitPrice") < 0)
-sum_qty_neg = df.filter(F.col("Quantity") < 0) \
-    .agg(F.sum("Quantity").alias("s")).collect()[0]["s"]
-n_facturas_con_dev = df.filter(F.col("Quantity") < 0).select("InvoiceNo").distinct().count()
-n_facturas_total_neg = df.groupBy("InvoiceNo") \
-    .agg(F.sum("revenue").alias("t")).filter(F.col("t") < 0).count()
-
-df_negativos = spark.createDataFrame(
-    [("Renglones con Quantity < 0", float(n_qty_neg)),
-     ("Renglones con UnitPrice < 0", float(n_price_neg)),
-     ("Unidades devueltas (sum Quantity < 0)", float(sum_qty_neg)),
-     ("Facturas con al menos un renglon negativo", float(n_facturas_con_dev)),
-     ("Facturas con total de factura negativo", float(n_facturas_total_neg))],
-    ["validacion", "valor"])
-print("\n[V1] Valores negativos en facturas")
-df_negativos.show(truncate=False)
-print("Muestra de valores negativos:")
-df.filter((F.col("Quantity") < 0) | (F.col("UnitPrice") < 0)) \
-    .select("InvoiceNo", "StockCode", "Quantity", "UnitPrice", "CustomerID") \
-    .limit(8).show(truncate=False)
-
-# --- V2. IDs repetidos --------------------------------------------------------
-ids_check = {}
-for _colid in ["InvoiceNo", "StockCode", "CustomerID"]:
-    tot = df.select(F.count(_colid)).collect()[0][0]
-    dist = df.select(F.countDistinct(_colid)).collect()[0][0]
-    ids_check[_colid] = (tot, dist, tot - dist)
-
-df_ids = spark.createDataFrame(
-    [("InvoiceNo", *ids_check["InvoiceNo"]),
-     ("StockCode", *ids_check["StockCode"]),
-     ("CustomerID", *ids_check["CustomerID"])],
-    ["id_columna", "total", "distintos", "repetidos"])
-print("\n[V2] IDs repetidos (repetidos = total - distintos)")
-df_ids.show(truncate=False)
-print("Top InvoiceNo con mas lineas:")
-df.groupBy("InvoiceNo").agg(F.count("*").alias("n")).filter(F.col("n") > 1) \
-    .orderBy(F.col("n").desc()).limit(5).show(truncate=False)
-print("Top StockCode con mas apariciones:")
-df.groupBy("StockCode").agg(F.count("*").alias("n")).filter(F.col("n") > 1) \
-    .orderBy(F.col("n").desc()).limit(5).show(truncate=False)
-print("Nota: varias lineas por factura es normal; el duplicado anomalo es la")
-print("      misma clave (InvoiceNo, StockCode) repetida (ver V3).")
-
-# --- V3. Datos iguales (filas totalmente iguales / duplicados) -----------------
-n_filas_unicas = df.dropDuplicates().count()
-n_dup_exactas = TOTAL_FILAS - n_filas_unicas
-df_dup_grupos = df.groupBy(df.columns).agg(F.count("*").alias("n_repetidos")) \
-    .filter(F.col("n_repetidos") > 1)
-n_grupos_dup = df_dup_grupos.count()
-filas_en_grupos_dup = df_dup_grupos.agg(F.sum("n_repetidos").alias("s")).collect()[0]["s"]
-
-df_dup_clave = df.groupBy("InvoiceNo", "StockCode") \
-    .agg(F.count("*").alias("n_repetidos")).filter(F.col("n_repetidos") > 1)
-n_dup_clave = df_dup_clave.count()
-
-df_datos_iguales = spark.createDataFrame(
-    [("Filas totalmente identicas (duplicados exactos)", float(n_dup_exactas)),
-     ("Grupos de filas identicas", float(n_grupos_dup)),
-     ("Filas involucradas en grupos duplicados", float(filas_en_grupos_dup)),
-     ("Duplicados por (InvoiceNo, StockCode)", float(n_dup_clave))],
-    ["validacion", "valor"])
-print("\n[V3] Datos iguales / duplicados")
-df_datos_iguales.show(truncate=False)
-print("Muestra de filas identicas repetidas:")
-df_dup_grupos.orderBy(F.col("n_repetidos").desc()) \
-    .select(*df.columns, "n_repetidos").limit(5).show(truncate=False)
-
-# --- V5. Valores nulos por columna ---------------------------------------------
-nulos_expr = [F.sum(F.when(F.col(c).isNull(), 1).otherwise(0)).alias(c) for c in COLUMNAS]
-df_nulos_row = df.select(*nulos_expr).collect()[0]
-
-df_nulos = spark.createDataFrame(
-    [(c, float(df_nulos_row[c])) for c in COLUMNAS], ["columna", "nulos"]) \
-    .withColumn("pct", F.round(F.col("nulos") / TOTAL_FILAS * 100, 2)) \
-    .orderBy(F.col("nulos").desc())
-print("\n[V5] Valores nulos por columna")
-df_nulos.show(truncate=False)
-
-# --- V6. Otras validaciones auxiliares -----------------------------------------
-n_cant_zero = _filas(F.col("Quantity") == 0)
-n_precio_zero = _filas(F.col("UnitPrice") == 0)
-n_fechas_null = _filas(F.col("InvoiceDateTs").isNull())
-n_desc_null = _filas(F.col("Description").isNull())
-n_es_cancelacion = _filas(F.col("es_cancelacion"))
-
-df_stock_invalido = df.filter(
-    F.col("StockCode").isNull() |
-    (F.trim(F.col("StockCode")) == "") |
-    ~F.col("StockCode").rlike("^[A-Za-z0-9]+$"))
-n_stock_invalido = df_stock_invalido.count()
-n_codigos_invalidos = df_stock_invalido.select("StockCode").distinct().count()
-
-df_desc_inc = df.where(F.col("Description").isNotNull()) \
-    .groupBy("StockCode") \
-    .agg(F.countDistinct("Description").alias("n_descripciones")) \
-    .filter(F.col("n_descripciones") > 1)
-n_stock_inconsistentes = df_desc_inc.count()
-
-df_aux = spark.createDataFrame(
-    [("Cantidad == 0", float(n_cant_zero)),
-     ("UnitPrice == 0", float(n_precio_zero)),
-     ("Fechas no parseadas", float(n_fechas_null)),
-     ("Description faltante", float(n_desc_null)),
-     ("Facturas canceladas (InvoiceNo C*)", float(n_es_cancelacion)),
-     ("Filas con StockCode invalido", float(n_stock_invalido)),
-     ("StockCodes invalidos (distintos)", float(n_codigos_invalidos)),
-     ("StockCodes con descripcion inconsistente", float(n_stock_inconsistentes))],
-    ["validacion", "valor"])
-print("\n[V6] Otras validaciones auxiliares")
-df_aux.show(truncate=False)
-
-# --- V7. Resumen consolidado de validaciones ----------------------------------
-df_resumen_valid = spark.createDataFrame([
-    ("Negativos", "Renglones con Quantity < 0", float(n_qty_neg)),
-    ("Negativos", "Renglones con UnitPrice < 0", float(n_price_neg)),
-    ("Negativos", "Facturas con total negativo", float(n_facturas_total_neg)),
-    ("Duplicados", "Filas duplicadas exactas", float(n_dup_exactas)),
-    ("Duplicados", "Duplicados por (InvoiceNo, StockCode)", float(n_dup_clave)),
-    ("IDs", "InvoiceNo con ocurrencias extra", float(ids_check["InvoiceNo"][2])),
-    ("IDs", "StockCode con ocurrencias extra", float(ids_check["StockCode"][2])),
-    ("Nulos", "Filas sin CustomerID", float(df_nulos_row["CustomerID"])),
-    ("Nulos", "Description faltante", float(n_desc_null)),
-    ("Nulos", "Fechas no parseadas", float(n_fechas_null)),
-    ("Claves", "StockCodes invalidos (distintos)", float(n_codigos_invalidos)),
-    ("Claves", "StockCodes con descripcion inconsistente", float(n_stock_inconsistentes)),
-    ("Registros", "Cancelaciones (InvoiceNo C*)", float(n_es_cancelacion)),
-], ["tipo", "validacion", "resultado"])
-
-print("\n[V7] Resumen consolidado de validaciones")
-df_resumen_valid.show(truncate=False)
 
 # ----------------------------------------------------------------------------
 # 6. Preguntas de negocio
@@ -398,7 +329,7 @@ q3.show(truncate=False)
 
 # --- Q4. Producto mas vendido en cantidad (sum, orderBy) --------------------
 df_productos = df_ventas.groupBy("StockCode", "Description") \
-    .agg(F.sum("Quantity").alias("total_cantidad"),
+    .agg(F.sum("Quantity").cast("double").alias("total_cantidad"),
          F.sum("revenue").alias("total_ingreso"))
 df_productos = df_productos.orderBy(F.col("total_cantidad").desc())
 
@@ -423,7 +354,7 @@ q5.show(truncate=False)
 df_paises = df_ventas.where(F.col("Country") != "United Kingdom") \
     .groupBy("Country") \
     .agg(F.sum("revenue").alias("total_ingreso"),
-         F.sum("Quantity").alias("total_cantidad")) \
+         F.sum("Quantity").cast("double").alias("total_cantidad")) \
     .orderBy(F.col("total_ingreso").desc())
 
 q6 = df_paises.limit(5)
@@ -434,7 +365,7 @@ q6.show(truncate=False)
 # --- Q7. Ticket promedio por factura (avg) -----------------------------------
 df_facturas = df_ventas.groupBy("InvoiceNo") \
     .agg(F.sum("revenue").alias("total_factura"),
-         F.sum("Quantity").alias("items_factura"),
+         F.sum("Quantity").cast("double").alias("items_factura"),
          F.countDistinct("StockCode").alias("n_productos"),
          F.first("CustomerID").alias("CustomerID"))
 
@@ -475,7 +406,7 @@ print("\n--- Q9. Ventas por mes (top = mes con mas ventas) ---")
 df_meses.show(12, truncate=False)
 
 # --- Q10. Porcentaje de facturas con devoluciones -----------------------------
-facturas_con_dev = df_limpio.where(F.col("Quantity") < 0) \
+facturas_con_dev = df_limpio.where(F.col("Quantity").cast("double") < 0) \
                      .select(F.countDistinct("InvoiceNo").alias("total")).collect()[0]["total"]
 
 pct_dev = (facturas_con_dev / facturas_totales) * 100
@@ -490,7 +421,7 @@ print("\n--- Q10. Porcentaje de facturas con devoluciones ---")
 q10.show(truncate=False)
 
 # ----------------------------------------------------------------------------
-# 6. Funciones de ventana (window): rank() y row_number()
+# 7. Funciones de ventana (window): rank() y row_number()
 # ----------------------------------------------------------------------------
 print("\n" + "=" * 70)
 print("FUNCIONES DE VENTANA: rank() y row_number()")
@@ -515,7 +446,7 @@ print("\nTop clientes por gasto (rank):")
 df_ranking_clientes.limit(5).show(truncate=False)
 
 # ----------------------------------------------------------------------------
-# 7. Union de DataFrames (join)
+# 8. Union de DataFrames (join)
 # ----------------------------------------------------------------------------
 print("\n" + "=" * 70)
 print("JOIN: facturas X clientes")
@@ -535,7 +466,7 @@ print("Ejemplo de join facturas-clientes:")
 df_facturas_clientes.show(5, truncate=False)
 
 # ----------------------------------------------------------------------------
-# 8. Resumen final de respuestas y LOAD (write.csv)
+# 9. Resumen final de respuestas y LOAD (write.csv)
 # ----------------------------------------------------------------------------
 print("\n" + "=" * 70)
 print("RESUMEN DE RESPUESTAS")
